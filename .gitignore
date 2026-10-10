@@ -1,0 +1,11 @@
+node_modules
+dist
+.next
+target
+.anchor
+test-ledger
+*.log
+.env
+.env.local
+apps/runtime/.data/
+coverage

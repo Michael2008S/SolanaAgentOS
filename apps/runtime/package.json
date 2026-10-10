@@ -1,0 +1,26 @@
+{
+  "name": "@agentos/runtime",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./x402-vault": "./src/x402-vault.ts"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:weather-provider": "tsx watch src/weather-provider.ts",
+    "dev:research-provider": "tsx watch src/research-provider.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@x402/svm": "^2.28.0",
+    "tsx": "^4.20.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@modelcontextprotocol/node": "^2.1.0",
+    "@modelcontextprotocol/server": "^2.3.1",
+    "@solana/kit": "^8.3.0",
+    "@x402/core": "^2.28.0",
+    "zod": "^4.6.5"
+  }
+}

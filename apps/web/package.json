@@ -1,0 +1,25 @@
+{
+  "name": "@agentos/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@solana/kit": "^8.3.0",
+    "@solana/kit-plugin-rpc": "^0.19.0",
+    "@solana/kit-plugin-wallet": "^0.20.0",
+    "@solana/react": "^8.0.0",
+    "@x402/core": "^2.28.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.2",
+    "vite": "^7.1.4"
+  }
+}

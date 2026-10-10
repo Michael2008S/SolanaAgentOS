@@ -1,0 +1,13 @@
+import {handoffSources} from './handoff-sources.js';
+import * as z from 'zod/v4';
+import {createHash} from 'node:crypto';
+import {isValidSolanaAddress} from './memory.js';
+const key=z.string().refine(isValidSolanaAddress),hash=z.string().regex(/^[a-f0-9]{64}$/),tenant=z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),text=z.string().trim().min(1).max(400);
+export const handoffDigest=(s:string)=>createHash('sha256').update(s).digest('hex');
+export const sharedHandoffSchema=z.object({escrow:key,task:text,result:text.nullable(),taskHash:hash,resultHash:hash.nullable(),sources:handoffSources.optional()}).strict().refine(v=>handoffDigest(v.task)===v.taskHash&&(v.result===null?v.resultHash===null:handoffDigest(v.result)===v.resultHash));
+const scope=z.object({escrow:key,taskHash:hash,access:z.enum(['read','write'])}).strict();
+export const sharedHandoffProfile=z.object({tenant,escrows:z.array(scope).min(1).max(200)}).strict().refine(p=>new Set(p.escrows.map(e=>e.escrow)).size===p.escrows.length);
+export const sharedHandoffProfiles=z.array(sharedHandoffProfile.safeExtend({tokenSha256:hash})).max(100).refine(ps=>ps.reduce((n,p)=>n+p.escrows.length,0)<=1000&&new Set(ps.map(p=>p.tenant)).size===ps.length&&new Set(ps.map(p=>p.tokenSha256)).size===ps.length&&ps.every(p=>new Set(p.escrows.map(e=>e.escrow)).size===p.escrows.length)&&ps.flatMap(p=>p.escrows).every(s=>ps.flatMap(p=>p.escrows).filter(e=>e.escrow===s.escrow).every(e=>e.taskHash===s.taskHash)));
+const common={version:z.literal(1),tenant,program:key,genesis:key,escrow:key,taskHash:hash};
+export const sharedHandoffCommand=z.discriminatedUnion('op',[z.object({...common,op:z.literal('get'),taskOnly:z.boolean()}).strict(),z.object({...common,op:z.literal('put'),task:text,result:text.nullable(),sources:handoffSources.optional()}).strict()]);
+export const sharedHandoffResponse=z.object({version:z.literal(1),program:key,genesis:key,handoff:sharedHandoffSchema.nullable()}).strict();

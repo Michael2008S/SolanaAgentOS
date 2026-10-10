@@ -1,0 +1,20 @@
+import {createServer} from 'node:http';
+import {address} from '@solana/kit';
+import {createHash,timingSafeEqual} from 'node:crypto';
+import {resolve} from 'node:path';
+import {loadRuntimeEnv} from './local-provider.js';
+import {readResponseTextLimited} from './http-limits.js';
+import {assertRuntimeNetwork} from './chain-network.js';
+import {HeadlessJournal} from './headless-journal.js';
+import {SharedHandoffService} from './shared-handoff.js';
+import {sharedHandoffProfiles} from './shared-handoff-protocol.js';
+loadRuntimeEnv();
+const profiles=sharedHandoffProfiles.parse(JSON.parse(process.env.AGENTOS_SHARED_HANDOFF_PROFILES?.trim()||'[]'));if(!profiles.length)throw new Error('Configure fixed shared handoff tenant scopes.');
+const program=process.env.AGENTOS_PROGRAM_ID?.trim()||'',genesis=process.env.AGENTOS_SHARED_HANDOFF_GENESIS?.trim()||'',endpoint=new URL(process.env.SOLANA_RPC_URL?.trim()||'https://api.devnet.solana.com');
+async function rpc(method:string,params:unknown[]){const response=await fetch(endpoint,{method:'POST',redirect:'error',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:AbortSignal.timeout(15000)}),value=JSON.parse(await readResponseTextLimited(response,10000,'Shared handoff RPC response exceeds its limit.'));if(!response.ok||value.error)throw new Error('Shared handoff RPC failed.');return value.result;}
+address(program);address(genesis);
+const actual=await rpc('getGenesisHash',[]);assertRuntimeNetwork(endpoint,actual);if(actual!==genesis)throw new Error('Pin the shared handoff full genesis.');
+const journal=new HeadlessJournal(resolve(process.env.AGENTOS_SHARED_HANDOFF_JOURNAL_PATH?.trim()||'apps/runtime/.data/shared-handoffs.sqlite')),service=new SharedHandoffService({program,genesis,profiles,journal,rpc});
+const server=createServer(async(req,res)=>{res.setHeader('Content-Type','application/json');res.setHeader('Cache-Control','no-store');const auth=req.headers.authorization;if(req.rawHeaders.filter((_,i)=>i%2===0&&req.rawHeaders[i].toLowerCase()==='authorization').length!==1||typeof auth!=='string'||!/^Bearer [A-Za-z0-9_-]{24,256}$/.test(auth)){res.writeHead(401).end('{}');return;}const hash=createHash('sha256').update(auth.slice(7)).digest(),profile=profiles.find(p=>timingSafeEqual(Buffer.from(p.tokenSha256,'hex'),hash));if(!profile){res.writeHead(401).end('{}');return;}if(req.method!=='POST'||req.url!=='/handoff'){res.writeHead(404).end('{}');return;}try{if(req.headers['content-type']?.split(';',1)[0].trim().toLowerCase()!=='application/json')throw new Error('JSON required.');let size=0;const chunks:Buffer[]=[];for await(const chunk of req){const bytes=Buffer.from(chunk);size+=bytes.length;if(size>1300000)throw new Error('Shared handoff request too large.');chunks.push(bytes);}res.end(JSON.stringify(await service.execute(profile.tenant,JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks))))));}catch{res.writeHead(422).end('{}');}});
+server.requestTimeout=20000;server.headersTimeout=10000;server.maxConnections=100;server.maxHeadersCount=40;const port=Number(process.env.AGENTOS_SHARED_HANDOFF_PORT||8792);if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid shared handoff port.');server.listen(port,'127.0.0.1',()=>console.log('Shared handoff service listening on loopback.'));
+let closing=false;async function close(){if(closing)return;closing=true;await new Promise<void>(done=>{server.close(()=>done());server.closeIdleConnections();});await service.drain();journal.close();}process.on('SIGTERM',()=>void close());process.on('SIGINT',()=>void close());

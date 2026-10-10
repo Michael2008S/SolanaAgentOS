@@ -1,0 +1,44 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { mkdtemp,rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash,randomUUID } from 'node:crypto';
+import { McpServer,createMcpHandler } from '@modelcontextprotocol/server';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import * as z from 'zod/v4';
+import { ExternalMcp,parseExternalMcpServers } from './external-mcp.js';
+import { HeadlessJournal } from './headless-journal.js';
+import { mcpExecutionScope } from './mcp-execution-scope.js';
+import type { AutonomousJob } from './autonomous-loop.js';
+test('shared original MCP receipts and preflight failures retain immutable job authorization across journal reopen',async()=>{
+ let calls=0,authorityChecks=0,denied=false;const handler=createMcpHandler(()=>{const server=new McpServer({name:'scope-test',version:'1.0.0'});server.registerTool('lookup',{inputSchema:z.object({query:z.string()})},async({query})=>{calls++;return {content:[{type:'text',text:query}]};});return server;},{responseMode:'json'}),http=createServer(toNodeHandler(handler));http.listen(0,'127.0.0.1');await once(http,'listening');const port=(http.address() as any).port,root=await mkdtemp(join(tmpdir(),'agentos-mcp-scope-')),file=join(root,'journal.sqlite');let journal=new HeadlessJournal(file);
+ const config=parseExternalMcpServers(JSON.stringify([{id:'public',endpoint:`http://127.0.0.1:${port}/mcp`,tools:['lookup']}])) ,action={key:'original',tool:'mcp:public:lookup',input:'{"query":"public fact"}',asset:'SOL' as const,amount:'0'},intentId=randomUUID(),job:AutonomousJob={version:1,id:randomUUID(),tenant:'owner',goal:'Public fact',agent:'A'.repeat(32),session:'B'.repeat(32),program:'C'.repeat(32),genesis:'D'.repeat(32),state:'executing',cycle:1,modelRequests:1,limits:{sol:'0',usdc:'0',maxCycles:1,maxActions:2,maxModelRequests:2,deadline:Math.floor(Date.now()/1000)+600,tools:[action.tool]},spent:{sol:'0',usdc:'0'},intents:[{id:intentId,action,phase:'reserved'}],pending:[],evaluations:[]};
+ try{const verify=async()=>{authorityChecks++;if(denied)throw new Error('Delegate revoked during discovery');};let client=new ExternalMcp(config,journal,fetch,true,verify);const receipt=await client.execute(job,action,intentId);assert.equal(calls,1);const record=journal.load(job.tenant,job.id,intentId)!;assert.equal(record.authorizationScopeHash,mcpExecutionScope(job,action));assert.throws(()=>journal.save({...record,authorizationScopeHash:undefined}),/cannot be replaced/);
+  journal.close();journal=new HeadlessJournal(file);client=new ExternalMcp(config,journal,fetch,true,verify);assert.deepEqual(await client.reconcile(job,intentId),receipt);
+  for(const limits of [{...job.limits,maxModelRequests:1},{...job.limits,deadline:job.limits.deadline+1}]){const changed={...job,limits};await assert.rejects(client.reconcile(changed,intentId),/limits cannot change/);await assert.rejects(client.execute(changed,action,intentId),/limits cannot change/);}assert.equal(calls,1);
+  assert.equal(authorityChecks,1);denied=true;
+  const blockedId=randomUUID(),blocked={...action,key:'blocked'},blockedJob={...job,intents:[{id:blockedId,action:blocked,phase:'reserved' as const}]};
+  const blockedReceipt=await client.execute(blockedJob,blocked,blockedId);assert.equal(blockedReceipt.outcome,'error');assert.equal(JSON.parse(blockedReceipt.output).result.code,'authority-before-dispatch');assert.equal(JSON.parse(blockedReceipt.output).dispatched,false);assert.equal(calls,1);assert.equal(journal.load(job.tenant,job.id,blockedId)!.complete,true);assert.equal(authorityChecks,2);assert.deepEqual(await client.reconcile(blockedJob,blockedId),blockedReceipt);denied=false;
+  const invalidId=randomUUID(),invalid={...action,key:'invalid',input:'[]'},invalidJob={...job,intents:[...job.intents,{id:invalidId,action:invalid,phase:'reserved' as const}]};const rejected=await client.execute(invalidJob,invalid,invalidId);assert.equal(rejected.outcome,'error');assert.equal(JSON.parse(rejected.output).dispatched,false);assert.equal(journal.load(job.tenant,job.id,invalidId)!.authorizationScopeHash,mcpExecutionScope(invalidJob,invalid));assert.equal(calls,1);
+  const storageId=randomUUID(),storageAction={...action,key:'storage'},storageJob={...job,intents:[{id:storageId,action:storageAction,phase:'reserved' as const}]},save=journal.save.bind(journal);let writes=0;
+  journal.save=()=>{writes++;throw new Error('Checkpoint unavailable');};try{await assert.rejects(client.execute(storageJob,storageAction,storageId),/Checkpoint unavailable/);assert.equal(writes,1);assert.equal(calls,1);assert.equal(journal.load(job.tenant,job.id,storageId),null);}finally{journal.save=save;}
+  const unresolvedId=randomUUID(),unknown={...action,key:'unknown'},unknownJob={...job,intents:[{id:unresolvedId,action:unknown,phase:'reserved' as const}]};journal.save({tenant:job.tenant,jobId:job.id,intentId:unresolvedId,scopeHash:createHash('sha256').update(JSON.stringify({agent:job.agent,session:job.session,program:job.program,genesis:job.genesis,action:unknown})).digest('hex'),authorizationScopeHash:mcpExecutionScope(unknownJob,unknown),execution:job.agent,complete:false});assert.equal(await client.reconcile(unknownJob,unresolvedId),null);let unknownChecks=0;await assert.rejects(client.execute(unknownJob,unknown,unresolvedId,async()=>{unknownChecks++;throw new Error('Unverifiable authority');}),/unresolved/);assert.equal(unknownChecks,0);assert.equal(journal.load(job.tenant,job.id,unresolvedId)!.complete,false);assert.equal(calls,1);
+ }finally{journal.close();await handler.close();http.closeAllConnections();await new Promise<void>(resolve=>http.close(()=>resolve()));await rm(root,{recursive:true,force:true});}
+});
+
+test('early authority and discovery failures are durable no-call receipts, while prior dispatches cannot be relabelled',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'agentos-mcp-preflight-')),journal=new HeadlessJournal(join(root,'journal.sqlite'));
+ let requests=0,checks=0;const config=parseExternalMcpServers(JSON.stringify([{id:'public',endpoint:'https://provider.example.com/mcp',tools:['lookup']}])) ,action={key:'original',tool:'mcp:public:lookup',input:'{}',asset:'SOL' as const,amount:'0'};
+ const makeJob=(id=randomUUID()):AutonomousJob=>({version:1,id:randomUUID(),tenant:'owner',goal:'Public fact',agent:'A'.repeat(32),session:'B'.repeat(32),program:'C'.repeat(32),genesis:'D'.repeat(32),state:'executing',cycle:1,modelRequests:1,limits:{sol:'0',usdc:'0',maxCycles:2,maxActions:2,maxModelRequests:4,deadline:Math.floor(Date.now()/1000)+600,tools:[action.tool]},spent:{sol:'0',usdc:'0'},intents:[{id,action,phase:'reserved'}],pending:[],evaluations:[]});
+ const transport=(async()=>{requests++;return new Response('Private upstream diagnostic',{status:503});}) as typeof fetch,client=new ExternalMcp(config,journal,transport,true);
+ try{
+  const early=makeJob(),id=early.intents[0].id,receipt=await client.execute(early,action,id,async()=>{checks++;throw new Error('Sensitive authority diagnostic');});assert.equal(requests,0);assert.equal(checks,1);assert.equal(receipt.outcome,'error');assert.equal(JSON.parse(receipt.output).result.code,'authority-before-discovery');assert.equal(JSON.parse(receipt.output).dispatched,false);assert.ok(!receipt.output.includes('Sensitive'));
+  assert.deepEqual(await client.execute(early,action,id,async()=>{checks++;}),receipt);assert.equal(checks,1);assert.deepEqual(await client.reconcile(early,id),receipt);
+  const discovery=makeJob(),other=discovery.intents[0].id,failed=await client.execute(discovery,action,other);assert.equal(requests,1);assert.equal(JSON.parse(failed.output).result.code,'discovery-failed');assert.equal(JSON.parse(failed.output).dispatched,false);assert.ok(!failed.output.includes('Private'));assert.deepEqual(await client.execute(discovery,action,other),failed);assert.equal(requests,1);
+  const pending=makeJob(),pendingId=pending.intents[0].id,record={tenant:pending.tenant,jobId:pending.id,intentId:pendingId,execution:pending.agent,scopeHash:createHash('sha256').update(JSON.stringify({agent:pending.agent,session:pending.session,program:pending.program,genesis:pending.genesis,action})).digest('hex'),authorizationScopeHash:mcpExecutionScope(pending,action),complete:false};journal.save(record);
+  await assert.rejects(client.execute(pending,action,pendingId,async()=>{checks++;throw new Error('Denied');}),/unresolved/);assert.equal(checks,1);assert.deepEqual(journal.load(pending.tenant,pending.id,pendingId),record);assert.equal(await client.reconcile(pending,pendingId),null);
+ }finally{journal.close();await rm(root,{recursive:true,force:true});}
+});

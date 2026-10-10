@@ -1,0 +1,25 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { address,getAddressEncoder,getProgramDerivedAddress } from '@solana/kit';
+import { verifyAutonomousTransaction } from './autonomous-proof.js';
+const directory='docs/evidence/real-model-2026-10-09T14-27-46-235Z/';
+const digest=(value:string)=>createHash('sha256').update(value).digest();
+test('independently checks a real finalized paid Skill receipt and rejects altered scope, fees and signatures',async()=>{
+ const report=JSON.parse(await readFile(directory+'report.json','utf8')),review=JSON.parse(await readFile(directory+'review.json','utf8')),step=report.steps[0];
+ const saved=JSON.parse(await readFile(directory+step.paymentSignature+'.json','utf8'));
+ const encoder=getAddressEncoder(),agentBytes=encoder.encode(address(review.agent));
+ const pda=async(name:string)=>String((await getProgramDerivedAddress({programAddress:address(review.program),seeds:[Buffer.from(name),agentBytes]}))[0]);
+ const sessionKey='A4tY3hnkM9fEmhLjQDtB6HgA7YL658qXsQE6bdzR3czh';
+ const accounts=[sessionKey,review.payer,review.agent,await pda('policy'),review.session,await pda('vault'),step.skill,review.provider,step.execution,'11111111111111111111111111111111'];
+ const amount=Buffer.alloc(8);amount.writeBigUInt64LE(1000000n);
+ const data=Buffer.concat([digest('global:pay_skill').subarray(0,8),amount,digest(JSON.stringify({skill:step.skill,prompt:step.prompt})),Buffer.alloc(8)]);
+ const run=(value:any,expected=accounts)=>verifyAutonomousTransaction(async()=>value,step.paymentSignature,review.program,expected,data,review.payer,sessionKey);
+ await run(saved.result);
+ await assert.rejects(()=>run({...saved.result,meta:{...saved.result.meta,fee:10001}}),/fee cap/);
+ await assert.rejects(()=>run({...saved.result,meta:{...saved.result.meta,err:{InstructionError:[0,1]}}}),/failed/);
+ await assert.rejects(()=>run(saved.result,accounts.map((key,index)=>index===4?review.agent:key)),/differs/);
+ const tampered=Buffer.from(saved.result.transaction[0],'base64');tampered[70]^=1;
+ await assert.rejects(()=>run({...saved.result,transaction:[tampered.toString('base64'),'base64']}),/signature is invalid/);
+});

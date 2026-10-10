@@ -1,0 +1,105 @@
+import assert from 'node:assert/strict';
+import { generateKeyPairSigner } from '@solana/kit';
+import * as sdk from '../../apps/web/src/lib/agentOs.ts';
+import { decodeTaskSnapshot } from '../../apps/runtime/src/task-state.ts';
+import { LocalHarness, digest, hex } from './harness.mts';
+
+// Protocol acceptance only. Browser orchestration, Judge model quality and
+// external wallets require their separate acceptance evidence.
+const h = new LocalHarness();
+try {
+  await h.start(); const init = await h.prepareReview(); await h.authorize();
+  const { payer, session, provider, workerOwner } = h.signers;
+  await h.tx('initialize completion Employer', [init.instruction]); const agent = init.accounts;
+  await h.tx('deposit local SOL for completion tests', [await sdk.buildDeposit(payer.address, agent.agent, agent.vault, 0.1)]);
+  await h.tx('deposit local USDC for completion tests', [await sdk.buildDepositUsdc(payer.address, agent.agent, '2')]);
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+  const created = await sdk.buildCreateSession(payer.address, agent.agent, agent.policy, session.address, deadline + 60n, 0.01, 0.1, 1, 2, ['api', 'payment', 'escrow']);
+  await h.tx('create scoped completion Session', [created.instruction]);
+  const taskId = 101n, taskText = 'Two fixed local payments and final completion';
+  const task = await sdk.buildCreateTask(payer.address, agent.agent, created.session, taskId, digest(taskText), 30_000_000n, 300_000n, deadline);
+  await h.tx('create Ready completion Task', [task.instruction]);
+  const view = () => h.data(task.task).then(bytes => decodeTaskSnapshot(task.task, bytes, sdk.PROGRAM_ADDRESS));
+  const planHash = digest('approved two-action plan'), resultHash = digest('verified two-payment final artifact');
+  const grant = await sdk.buildGrantTaskCompletion(payer.address, agent.agent, created.session, taskId, planHash, 2n, deadline, true);
+  await h.tx('one Owner authorization grants completion and starts Ready Task', [grant.instruction]);
+  assert.equal((await view()).status, 'running');
+  const permit = await h.data(grant.permit); assert.equal(permit.length, 155); assert.equal(permit.readBigUInt64LE(136), 2n); assert.equal(permit[153], 0);
+  const completion = (overrides: Partial<Parameters<typeof sdk.buildCompleteSessionTask>[0]> = {}) => sdk.buildCompleteSessionTask({ agent: agent.agent, session: created.session, sessionSigner: session, taskId, planHash, resultHash, spentSol: 1_000_000n, spentUsdc: 100_000n, ...overrides });
+  await h.tx('automatic completion rejects unfinished action count', [(await completion()).instruction], [], 'TaskCompletionChanged');
+  await h.tx('automatic completion rejects changed plan', [(await completion({ planHash: digest('another plan') })).instruction], [], 'InvalidTaskCompletion');
+  let executionId = 0n;
+  for (const asset of ['SOL', 'USDC'] as const) {
+    const payment = await sdk.buildTaskPayment({ feePayer: payer.address, agent: agent.agent, session: created.session, sessionSigner: session, taskId, executionId: executionId++, actionId: asset === 'SOL' ? 1n : 2n, recipient: provider.address, asset, amountAtomic: asset === 'SOL' ? 1_000_000n : 100_000n, inputHash: digest(`${asset} exact payment`), outputHash: digest(`${asset} payment output`) });
+    await h.tx(`execute planned ${asset} payment`, [payment.instruction]);
+  }
+  assert.equal((await view()).actionCount, '2');
+  await h.tx('completion rejects changed SOL snapshot', [(await completion({ spentSol: 1_000_001n })).instruction], [], 'TaskCompletionChanged');
+  await h.tx('completion rejects changed USDC snapshot', [(await completion({ spentUsdc: 100_001n })).instruction], [], 'TaskCompletionChanged');
+  const zeroResult = (await completion()).instruction;
+  await h.tx('completion rejects empty result', [{ ...zeroResult, data: new Uint8Array(zeroResult.data!).fill(0, 40, 72) }], [], 'TaskResultRequired');
+  await h.tx('pause completion Task', [(await sdk.buildSetTaskStatus(payer.address, agent.agent, taskId, 'paused')).instruction]);
+  await h.tx('paused Task cannot finish with Session', [(await completion()).instruction], [], 'InvalidTaskState');
+  await h.tx('resume completion Task', [(await sdk.buildSetTaskStatus(payer.address, agent.agent, taskId, 'running')).instruction]);
+  await h.tx('revoke completion capability', [(await sdk.buildRevokeTaskCompletion(payer.address, agent.agent, taskId)).instruction]);
+  await h.tx('revoked capability cannot finish Task', [(await completion()).instruction], [], 'InvalidTaskCompletion');
+  await h.tx('renew exact completion capability', [(await sdk.buildGrantTaskCompletion(payer.address, agent.agent, created.session, taskId, planHash, 2n, deadline)).instruction]);
+  await h.tx('fund completion Session network fees', [sdk.buildFundSessionFeeReserve(payer.address, session.address, 0.01)]);
+  const sessionBefore = await h.sol(session.address);
+  const finalSignature = await h.tx('Session commits final Task result without Owner signature', [(await completion()).instruction], [], undefined, session);
+  const finalTransaction = await h.rpc('getTransaction', [finalSignature, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]);
+  assert.equal(finalTransaction.transaction.message.accountKeys[0], session.address);
+  const finalSigners = finalTransaction.transaction.message.accountKeys.slice(0, finalTransaction.transaction.message.header.numRequiredSignatures);
+  assert.deepEqual(finalSigners, [session.address]);
+  assert.ok(!finalSigners.includes(payer.address));
+  assert.equal(sessionBefore - await h.sol(session.address), BigInt(finalTransaction.meta.fee));
+  h.pass('Final Task transaction has exactly one Session signature and charges its own fee reserve', { finalSignature, finalSigners, feeLamports: finalTransaction.meta.fee });
+  const finished = await view(); assert.equal(finished.status, 'completed'); assert.equal(finished.resultHash, hex(resultHash)); assert.equal((await h.data(grant.permit))[153], 1);
+  await h.tx('completed Task rejects duplicate finish', [(await completion()).instruction], [], 'InvalidTaskState');
+  await h.tx('completed Task cannot reopen completion authorization', [grant.instruction], [], 'InvalidTaskState');
+  h.pass('Exact plan completion uses Session authority, consumes permit and preserves gross SOL/USDC spend', { task: task.task, resultHash: finished.resultHash, spentSol: finished.sol.spent, spentUsdc: finished.usdc.spent });
+
+  const secondSigner = await generateKeyPairSigner(), replacementSigner = await generateKeyPairSigner();
+  const second = await sdk.buildCreateSession(payer.address, agent.agent, agent.policy, secondSigner.address, deadline + 60n, 0.01, 0.1, 1, 2, ['api', 'payment', 'escrow']);
+  const replacement = await sdk.buildCreateSession(payer.address, agent.agent, agent.policy, replacementSigner.address, deadline + 60n, 0.01, 0.1, 1, 2, ['api', 'payment', 'escrow']);
+  await h.tx('create second Task Session', [second.instruction]); await h.tx('create replacement Task Session', [replacement.instruction]);
+  const secondId = 102n, secondTask = await sdk.buildCreateTask(payer.address, agent.agent, second.session, secondId, digest('replacement completion test'), 10_000_000n, 0n, deadline);
+  await h.tx('create replacement completion Task', [secondTask.instruction]);
+  await h.tx('grant old Session completion capability', [(await sdk.buildGrantTaskCompletion(payer.address, agent.agent, second.session, secondId, planHash, 1n, deadline, true)).instruction]);
+  await h.tx('replace bound Task Session', [(await sdk.buildReplaceTaskSession(payer.address, agent.agent, secondId, replacement.session)).instruction]);
+  const oldComplete = await sdk.buildCompleteSessionTask({ agent: agent.agent, session: second.session, sessionSigner: secondSigner, taskId: secondId, planHash, resultHash, spentSol: 0n, spentUsdc: 0n });
+  const newComplete = await sdk.buildCompleteSessionTask({ agent: agent.agent, session: replacement.session, sessionSigner: replacementSigner, taskId: secondId, planHash, resultHash, spentSol: 1_000_000n, spentUsdc: 0n });
+  await h.tx('old Session cannot complete replaced Task', [oldComplete.instruction], [], 'ConstraintHasOne');
+  await h.tx('replacement Session cannot reuse old completion permit', [newComplete.instruction], [], 'ConstraintHasOne');
+  await h.tx('Owner reauthorizes replacement completion Session', [(await sdk.buildGrantTaskCompletion(payer.address, agent.agent, replacement.session, secondId, planHash, 1n, deadline)).instruction]);
+  const secondPay = await sdk.buildTaskPayment({ feePayer: payer.address, agent: agent.agent, session: replacement.session, sessionSigner: replacementSigner, taskId: secondId, executionId: executionId++, actionId: 1n, recipient: provider.address, asset: 'SOL', amountAtomic: 1_000_000n, inputHash: digest('replacement payment'), outputHash: digest('replacement output') });
+  await h.tx('replacement Session executes one planned action', [secondPay.instruction]); await h.tx('replacement Session completes explicitly reauthorized Task', [newComplete.instruction]);
+  h.pass('Replacing Session invalidates old completion authority until Owner reauthorization');
+
+  await h.tx('fund temporary Worker Owner', [sdk.buildFundSessionFeeReserve(payer.address, workerOwner.address, 0.03)]);
+  await h.tx('fund temporary Skill Provider', [sdk.buildFundSessionFeeReserve(payer.address, provider.address, 0.03)]);
+  const worker = await sdk.buildInitializeAgent(workerOwner.address, 'Pending completion Worker', 1, 0.1, 10, 1, ['api', 'payment', 'escrow']);
+  await h.tx('initialize pending-work Worker', [worker.instruction], [workerOwner]);
+  const pendingSigner = await generateKeyPairSigner(), pendingSession = await sdk.buildCreateSession(payer.address, agent.agent, agent.policy, pendingSigner.address, deadline + 60n, 0.01, 0.1, 1, 2, ['api', 'payment', 'escrow']);
+  await h.tx('create pending-work Session', [pendingSession.instruction]);
+  const pendingId = 103n, pendingTask = await sdk.buildCreateTask(payer.address, agent.agent, pendingSession.session, pendingId, digest('pending results'), 10_000_000n, 0n, deadline);
+  await h.tx('create pending-work Task', [pendingTask.instruction]); await h.tx('authorize pending-work Task and start', [(await sdk.buildGrantTaskCompletion(payer.address, agent.agent, pendingSession.session, pendingId, planHash, 2n, deadline, true)).instruction]);
+  const skill = await sdk.buildRegisterSkill(provider.address, digest('completion fixture'), digest('http://127.0.0.1/fixture'), 0.001, '0');
+  await h.tx('register pending-result Skill', [skill.instruction], [provider]);
+  const paidSkill = await sdk.buildPayTaskSkill({ feePayer: payer.address, agent: agent.agent, session: pendingSession.session, sessionSigner: pendingSigner, taskId: pendingId, executionId: executionId++, actionId: 1n, skill: skill.skill, provider: provider.address, asset: 'SOL', expectedPrice: 1_000_000n, inputHash: digest('pending Skill request') });
+  await h.tx('pay Skill without registering result yet', [paidSkill.instruction]);
+  const escrow = await sdk.buildCreateTaskEscrow({ feePayer: payer.address, agent: agent.agent, session: pendingSession.session, sessionSigner: pendingSigner, taskId: pendingId, actionId: 2n, escrowId: 900n, executionId: executionId++, workerAgent: worker.accounts.agent, asset: 'SOL', amountAtomic: 2_000_000n, deadline: deadline - 30n, taskHash: digest('pending Worker job') });
+  await h.tx('fund pending Task Worker Escrow', [escrow.instruction]);
+  const pendingComplete = await sdk.buildCompleteSessionTask({ agent: agent.agent, session: pendingSession.session, sessionSigner: pendingSigner, taskId: pendingId, planHash, resultHash, spentSol: 3_000_000n, spentUsdc: 0n });
+  await h.tx('automatic completion rejects pending Skill and Escrow', [pendingComplete.instruction], [], 'TaskResultRequired');
+  const output = await sdk.buildRecordTaskSkillResult({ feePayer: payer.address, agent: agent.agent, session: pendingSession.session, sessionSigner: pendingSigner, taskId: pendingId, actionId: 1n, execution: paidSkill.execution, outputHash: digest('fixed Skill result') });
+  await h.tx('record pending Skill output', [output]);
+  await h.tx('automatic completion still rejects open Worker Escrow', [pendingComplete.instruction], [], 'TaskResultRequired');
+  await h.tx('pause Agent Policy', [await sdk.buildUpdatePolicy(payer.address, agent.agent, agent.policy, 5, 1, 100, 20, ['api', 'payment', 'escrow'], true)]);
+  await h.tx('Policy pause blocks delegated completion', [pendingComplete.instruction], [], 'PolicyPaused');
+  await h.tx('resume Agent Policy', [await sdk.buildUpdatePolicy(payer.address, agent.agent, agent.policy, 5, 1, 100, 20, ['api', 'payment', 'escrow'], false)]);
+  await h.tx('revoke pending-work Session', [(await sdk.buildRevokeSession(payer.address, agent.agent, pendingSigner.address)).instruction]);
+  await h.tx('revoked Session cannot declare Task complete', [pendingComplete.instruction], [], 'SessionRevoked');
+  h.pass('Pending Skill/Worker results and live Policy/Session constraints block automatic completion');
+  await h.finish();
+} catch (error) { console.error(error); if (h.root) await h.finish(error); process.exitCode = 1; }

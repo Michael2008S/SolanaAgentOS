@@ -1,0 +1,8 @@
+import * as z from 'zod/v4';
+import { isValidSolanaAddress } from './memory.js';
+const key=z.string().refine(isValidSolanaAddress),hash=z.string().regex(/^[a-f0-9]{64}$/),tenant=z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
+export const judgeAssessment=z.object({verdict:z.enum(['pass','fail','needs_review']),confidence:z.number().finite().min(0).max(1),summary:z.string().trim().min(1).max(600),checks:z.array(z.object({criterion:z.string().trim().min(1).max(200),status:z.enum(['met','not_met','unclear']),evidence:z.string().max(400)}).strict()).min(1).max(8),limitations:z.array(z.string().max(500)).max(6)}).strict().refine(value=>value.verdict==='needs_review'||value.verdict==='pass'&&value.checks.every(check=>check.status==='met')||value.verdict==='fail'&&value.checks.some(check=>check.status==='not_met'),'Verdict must agree with the stated checks.');
+export const judgeRecordInput=z.object({tenant,escrow:key,taskHash:hash,resultHash:hash,judgment:judgeAssessment}).strict();
+export type JudgeRecordInput=z.infer<typeof judgeRecordInput>;
+export const judgeRecordProfiles=z.array(z.object({tenant,minimumConfidence:z.number().finite().min(0).max(1).default(0.9),escrows:z.array(z.object({escrow:key,taskHash:hash}).strict()).min(1).max(100)}).strict()).max(100).refine(profiles=>new Set(profiles.map(profile=>profile.tenant)).size===profiles.length&&profiles.every(profile=>new Set(profile.escrows.map(item=>item.escrow)).size===profile.escrows.length));
+export const judgeRecordReceipt=z.object({tenant,escrow:key,decision:key,taskHash:hash,resultHash:hash,judgmentHash:hash,verdict:z.enum(['pass','fail','needs_review']),signature:z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{64,88}$/),commitment:z.literal('finalized')}).strict();

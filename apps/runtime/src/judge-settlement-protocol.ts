@@ -1,0 +1,6 @@
+import * as z from 'zod/v4';
+import { judgeRecordInput } from './judge-record-protocol.js';
+const key=judgeRecordInput.shape.escrow,hash=judgeRecordInput.shape.taskHash,atomic=z.string().regex(/^[1-9][0-9]{0,19}$/).refine(s=>BigInt(s)<=18446744073709551615n);
+export const judgeSettlementProfiles=z.array(z.object({tenant:judgeRecordInput.shape.tenant,escrows:z.array(z.object({escrow:key,taskHash:hash,asset:z.enum(['SOL','USDC']),maxAmount:atomic,maxRentLamports:z.number().int().min(0).max(10000000).default(0)}).strict()).min(1).max(100)}).strict()).max(100).refine(profiles=>new Set(profiles.map(p=>p.tenant)).size===profiles.length&&new Set(profiles.flatMap(p=>p.escrows.map(s=>s.escrow))).size===profiles.reduce((n,p)=>n+p.escrows.length,0));
+export const judgeSettlementReceipt=z.object({tenant:judgeRecordInput.shape.tenant,escrow:key,decision:key,taskHash:hash,resultHash:hash,judgmentHash:hash,verdict:z.enum(['pass','fail']),asset:z.enum(['SOL','USDC']),amount:atomic,destination:key,execution:key.nullable(),task:key.nullable(),signature:z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{64,88}$/),commitment:z.literal('finalized')}).strict();
+export type JudgeSettlementReceipt=z.infer<typeof judgeSettlementReceipt>;

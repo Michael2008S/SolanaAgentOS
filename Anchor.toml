@@ -1,0 +1,24 @@
+[toolchain]
+anchor_version = "1.2.0"
+solana_version = "3.1.10"
+package_manager = "npm"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+agent_os = "HWwd3RWsmiZ1uo1rd66oj3KaTXggW3B9zNUSFEUCbVzv"
+
+[programs.devnet]
+agent_os = "HWwd3RWsmiZ1uo1rd66oj3KaTXggW3B9zNUSFEUCbVzv"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[workspace]
+members = ["programs/agent_os"]
+
+[scripts]
+build = "anchor build"

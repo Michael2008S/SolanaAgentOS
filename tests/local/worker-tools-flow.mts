@@ -1,0 +1,68 @@
+import { createServer,type Server } from 'node:http';
+import { once } from 'node:events';
+import { HeadlessWorkerTool } from '../../apps/runtime/src/headless-worker-tool.ts';
+import { HeadlessJournal } from '../../apps/runtime/src/headless-journal.ts';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import {mkdir,readFile,writeFile} from 'node:fs/promises';
+import {join,resolve} from 'node:path';
+import { LocalHarness,digest,hex } from './harness.mts';
+import { startModelFixture } from './model-fixture.mts';
+import * as sdk from '../../apps/web/src/lib/agentOs.ts';
+const asset: 'SOL'|'USDC'=process.argv.includes('--usdc')?'USDC':'SOL';
+const gateway=process.argv.includes('--gateway');const background=gateway||process.argv.includes('--background'),directory=background?resolve('docs/evidence/'+(gateway?'worker-tool-gateway-':'background-worker-tools-')+asset.toLowerCase()+'-'+new Date().toISOString().replace(/[:.]/g,'-')):undefined;if(directory)await mkdir(directory);
+let toolServer:Server|undefined,toolJournal:HeadlessJournal|undefined,providerExecutions=0,cacheReads=0;const h=new LocalHarness();let fixture:Awaited<ReturnType<typeof startModelFixture>>|undefined;
+try{
+ await h.start();if(background){const original=h.rpc.bind(h);let sends=0;h.rpc=async(method,params=[])=>{if(method==='sendTransaction'){assert.ok(++sends<=30);params=[params[0],{...(params[1] as object),maxRetries:30}];}return original(method,params);};}const init=await h.prepareReview();if(background)h.approved=true;else await h.authorize();const {payer,session,workerSession,provider}=h.signers;
+ const employer=init.accounts;await h.tx('initialize tool Employer',[init.instruction]);
+ const wi=await sdk.buildInitializeAgent(payer.address,'Local tool Worker',5,1,100,20,['api','payment','escrow']);await h.tx('initialize tool Worker',[wi.instruction]);const worker=wi.accounts;
+ for(const a of [employer,worker])await h.tx('deposit tool Vault',[await sdk.buildDeposit(payer.address,a.agent,a.vault,0.03)]);
+ if(asset==='USDC')await h.tx('deposit Worker tool USDC',[await sdk.buildDepositUsdc(payer.address,worker.agent,'1')]);
+ const deadline=BigInt(Math.floor(Date.now()/1000)+(background?600:120));
+ const es=await sdk.buildCreateSession(payer.address,employer.agent,employer.policy,session.address,deadline+10n,0.02,0.03,1,2,['api','escrow']);await h.tx('create tool Employer Session',[es.instruction]);
+ const ws=await sdk.buildCreateSession(payer.address,worker.agent,worker.policy,workerSession.address,deadline+10n,0.02,0.03,1,2,['api','escrow']);await h.tx('create tool Worker Session',[ws.instruction]);
+ const taskText='Summarize paid local evidence for the Worker tool test.';
+ const escrow=await sdk.buildCreateEscrow(payer.address,employer.agent,employer.policy,employer.vault,es.session,session,worker.agent,0.01,0n,deadline,digest(taskText),0n);await h.tx('fund tool Escrow',[escrow.instruction]);
+ await h.tx('fund tool Provider',[sdk.buildFundSessionFeeReserve(payer.address,provider.address,0.02)]);
+ const endpoint='http://127.0.0.1:19788/fixture';const skill=await sdk.buildRegisterSkill(provider.address,digest('worker-tool'),digest(endpoint),0.001,'0.1');await h.tx('register Worker tool Skill',[skill.instruction],[provider]);
+ fixture=await startModelFixture(0);process.env.AGENTOS_LOCAL_MODEL_URL=fixture.url;await h.runtime();
+ const request={skill:skill.skill,asset,prompt:'Local evidence facts',endpoint,maxAmount:asset==='SOL'?'1000000':'100000'};
+ const job=(await h.api('/api/worker/jobs',{escrow:escrow.escrow,workerAgent:worker.agent,task:taskText,evidence:'',sourceExecutions:[],toolRequests:[request]})).job;
+ assert.equal(job.state,'waiting_tools');const toolId=job.tools[0].id;const key={escrow:escrow.escrow,toolId};
+ await h.api('/api/worker/tool-complete',key,422);
+ const started=(await h.api('/api/worker/tool-start',key)).job;assert.equal(started.tools[0].state,'dispatched');await h.api('/api/worker/tool-start',key,422);
+ await h.api('/api/worker/tool-release',key);const fresh=(await h.api('/api/worker/tool-start',key)).job;assert.notEqual(fresh.tools[0].dispatchId,started.tools[0].dispatchId);h.pass('Worker tool reservation is exclusive and unbound release rotates reservation');
+ const task=await sdk.buildCreateTask(payer.address,worker.agent,ws.session,0n,digest(taskText),asset==='SOL'?2_000_000n:0n,asset==='USDC'?200_000n:0n,deadline);await h.tx('create independent Worker tool Task',[task.instruction]);await h.tx('start Worker tool Task',[(await sdk.buildSetTaskStatus(payer.address,worker.agent,0n,'running')).instruction]);
+ const paid=await sdk.buildPayTaskSkill({feePayer:payer.address,agent:worker.agent,session:ws.session,sessionSigner:workerSession,taskId:0n,actionId:0n,executionId:0n,skill:skill.skill,provider:provider.address,asset,expectedPrice:asset==='SOL'?1_000_000n:100_000n,inputHash:digest(JSON.stringify({skill:skill.skill,prompt:request.prompt}))});
+ const binding={...key,dispatchId:fresh.tools[0].dispatchId,execution:paid.execution,taskId:'0',actionId:'0'};
+ await h.api('/api/worker/tool-bind',{...binding,dispatchId:randomUUID()},422);await h.api('/api/worker/tool-bind',binding);await h.api('/api/worker/tool-release',key,422);await h.api('/api/worker/tool-bind',{...binding,execution:worker.agent},422);await h.api('/api/worker/tool-complete',key,422);
+ const content='LOCAL TEST FIXTURE: committed Worker tool evidence.';
+ if(gateway){
+  const {createAgentOsVaultSkillHandler}=await import('../../apps/runtime/src/x402-vault.ts'),{localClaimExecution}=await import('../../apps/runtime/src/local-provider.ts'),{localSkillResultStore}=await import('../../apps/runtime/src/skill-result-store.ts');
+  const handler=createAgentOsVaultSkillHandler({programId:sdk.PROGRAM_ADDRESS,skill:skill.skill,resourceUrl:endpoint,allowedOrigins:['http://127.0.0.1:15173'],rpcUrl:h.rpcUrl,claimExecution:localClaimExecution('worker-gateway-fixture'),resultStore:localSkillResultStore('worker-gateway-fixture',sdk.PROGRAM_ADDRESS),execute:async()=>{providerExecutions++;return content;}});
+  let drop=true;toolServer=createServer(async(req,res)=>{try{const chunks=[];for await(const c of req)chunks.push(Buffer.from(c));const response=await handler(new Request(endpoint,{method:req.method,headers:req.headers as Record<string,string>,body:Buffer.concat(chunks)}));const text=await response.text();if(req.headers['agentos-result-only']==='true')cacheReads++;if(drop&&response.status===200&&req.headers['payment-signature']){drop=false;res.destroy();return;}res.writeHead(response.status,Object.fromEntries(response.headers)).end(text);}catch{res.writeHead(500).end();}});toolServer.listen(19788,'127.0.0.1');await once(toolServer,'listening');
+  const file=join(h.root,'worker-tool-gateway.sqlite'),input={tenant:'worker',escrow:escrow.escrow,taskHash:hex(digest(taskText)),toolId,dispatchId:fresh.tools[0].dispatchId},options={program:sdk.PROGRAM_ADDRESS,genesis:h.genesis,rpc:h.rpc.bind(h),feePayer:payer,signers:new Map([['worker',workerSession]]),identities:[{tenant:'worker',agent:worker.agent,session:ws.session}],profiles:[{tenant:'worker',escrow:escrow.escrow,taskHash:input.taskHash,taskId:'0',tools:[{request,executionId:'0',actionId:'0'}]}]};
+  toolJournal=new HeadlessJournal(file);let executor=new HeadlessWorkerTool({...options,journal:toolJournal});assert.deepEqual(await executor.preflight(input),{execution:paid.execution,taskId:'0',actionId:'0'});
+  await assert.rejects(executor.execute({...input,dispatchId:randomUUID(),toolId:'0'.repeat(64)}),/fixed tenant/);assert.equal(providerExecutions,0);
+  await assert.rejects(executor.execute(input),/fetch failed/);assert.equal(providerExecutions,1);assert.equal(cacheReads,0);
+  toolJournal.close();toolJournal=new HeadlessJournal(file);executor=new HeadlessWorkerTool({...options,journal:toolJournal});const result=await executor.execute(input);assert.equal(result.execution,paid.execution);assert.equal(result.taskId,'0');assert.equal(result.actionId,'0');
+  assert.equal(result.content,content);
+  (h.transactions as any[]).push({name:'pay bound Worker Task Skill',signature:result.paymentSignature,units:0,confirmed:true},{name:'commit Worker tool response',signature:result.resultSignature,units:0,confirmed:true});
+  assert.deepEqual(await executor.execute(input),result);await assert.rejects(executor.execute({...input,dispatchId:randomUUID()}),/scope cannot change/);assert.equal(providerExecutions,1);assert.equal(cacheReads,1);
+  await h.api('/api/memory',{agent:worker.agent,execution:paid.execution,title:'Worker tool evidence',content:result.content,tags:['local']});
+  h.pass('Fixed gateway pays Task Skill, restores journal after lost original response, commits exact cached body, and prevents duplicate execution or changed reservation');
+ }else{
+  await h.tx('pay bound Worker Task Skill',[paid.instruction]);await h.api('/api/worker/tool-complete',key,422);
+  await h.tx('commit Worker tool response',[await sdk.buildRecordTaskSkillResult({feePayer:payer.address,agent:worker.agent,session:ws.session,sessionSigner:workerSession,taskId:0n,actionId:0n,execution:paid.execution,outputHash:digest(content)})]);await h.api('/api/worker/tool-complete',key,422);
+ }
+
+ if(!gateway)await h.api('/api/memory',{agent:worker.agent,execution:paid.execution,title:'Worker tool evidence',content,tags:['local']});if(background)process.env.AGENTOS_WORKER_TOOL_RECOVERY=JSON.stringify([{workerAgent:worker.agent,escrow:escrow.escrow,taskHash:'a'.repeat(64)}]);await h.restartRuntime();
+ const recovered=(await h.api(`/api/worker/jobs?worker=${worker.agent}`)).jobs[0];assert.deepEqual({...recovered.tools[0],state:'dispatched'},{...fresh.tools[0],execution:paid.execution,taskId:'0',actionId:'0'});h.pass('Bound tool reservation survives restart and cannot be replaced or completed before verified Memory');
+ if(background){await new Promise(r=>setTimeout(r,1200));assert.equal(fixture.requests.length,0);assert.equal(recovered.tools[0].state,'dispatched');process.env.AGENTOS_WORKER_TOOL_RECOVERY=JSON.stringify([{workerAgent:worker.agent,escrow:escrow.escrow,taskHash:hex(digest(taskText))}]);await h.restartRuntime();h.pass('Mismatched fixed task hash cannot enable background tool recovery');}
+ if(!background){const complete=(await h.api('/api/worker/tool-complete',key)).job;assert.equal(complete.tools[0].state,'complete');await h.api('/api/worker/tool-complete',key);}
+ let ready:any;for(let n=0;n<100;n++){ready=(await h.api(`/api/worker/jobs?worker=${worker.agent}`)).jobs[0];if(ready.state==='ready')break;assert.notEqual(ready.state,'failed');await new Promise(r=>setTimeout(r,100));}assert.equal(ready.state,'ready');assert.equal(ready.model,'local-test-fixture');assert.equal(ready.resultHash,hex(digest(ready.result)));h.pass('Verified TaskAction and Memory unlock Worker draft; completion is idempotent');
+ if(background){assert.equal(ready.tools[0].state,'complete');assert.equal(fixture.requests.length,1);await h.restartRuntime();await new Promise(r=>setTimeout(r,1200));const again=(await h.api(`/api/worker/jobs?worker=${worker.agent}`)).jobs[0];assert.equal(again.state,'ready');assert.deepEqual(again.tools,ready.tools);assert.equal(fixture.requests.length,1);h.pass('Fixed background scope automatically verifies bound Skill Memory after restart, with no tool-complete request or repeat model');}
+ if(directory){const last=(h.transactions.at(-1) as any).signature;for(let n=0;n<250;n++){const status=(await h.rpc('getSignatureStatuses',[[last],{searchTransactionHistory:true}])).value[0];if(status?.confirmationStatus==='finalized')break;if(n===249)throw new Error('Tool result did not finalize');await new Promise(r=>setTimeout(r,100));}const snapshots:Record<string,unknown>={};for(const account of [worker.agent,ws.session,escrow.escrow,task.task,paid.taskAction,paid.execution])snapshots[String(account)]=await h.rpc('getAccountInfo',[String(account),{encoding:'base64',commitment:'finalized'}]);await writeFile(join(directory,'account-snapshots.json'),JSON.stringify(snapshots,(_k,v)=>typeof v==='bigint'?v.toString():v,2)+'\n');for(const name of ['pay bound Worker Task Skill','commit Worker tool response']){const row=h.transactions.find((r:any)=>r.name===name) as any;const tx=await h.rpc('getTransaction',[row.signature,{encoding:'base64',commitment:'finalized',maxSupportedTransactionVersion:0}]);assert.equal(tx.meta.err,null);await writeFile(join(directory,name.startsWith('pay')?'payment-transaction.json':'result-transaction.json'),JSON.stringify(tx,(_k,v)=>typeof v==='bigint'?v.toString():v,2)+'\n');}}
+ await h.finish();
+ if(directory){const report=JSON.parse(await readFile(join(h.root,'report.json'),'utf8'));Object.assign(report,{asset,backgroundToolRecovery:true,realModelRequests:0,localModelRequests:fixture.requests.length,worker:worker.agent,workerSession:ws.session,sessionSigner:workerSession.address,feePayer:payer.address,provider:provider.address,task:task.task,taskAction:paid.taskAction,escrow:escrow.escrow,toolExecution:paid.execution,content,request,ready,taskSkillGateway:gateway,gatewayJournalReopened:gateway,providerExecutions,cacheReads});await writeFile(join(directory,'report.json'),JSON.stringify(report,null,2)+'\n');}
+}catch(e){console.error(e);if(h.root){await h.finish(e);if(directory)await writeFile(join(directory,'report.json'),await readFile(join(h.root,'report.json')));}process.exitCode=1;}finally{toolJournal?.close();if(toolServer){toolServer.closeAllConnections();await new Promise<void>(r=>toolServer!.close(()=>r()));}if(fixture)await new Promise<void>(r=>fixture!.server.close(()=>r()));}
