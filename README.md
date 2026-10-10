@@ -6,8 +6,6 @@ AgentOS is a Solana Agent Runtime and economic kernel. The first slice in this w
 
 ## Run the control center
 
-For a Chinese step-by-step guide covering local setup, web operations, payments, Worker/Judge coordination, background execution, recovery, and Devnet, see the [scenario reproduction guide](docs/SCENARIO_REPRODUCTION_GUIDE.md).
-
 For a complete, step-by-step Devnet demonstration—including wallet setup, deployment, Agent creation, payments, Escrow settlement, optional paid Skills, Session automation, MCP inspection, and troubleshooting—see the [judge demo runbook](docs/DEMO_RUNBOOK.md).
 
 For reproducible build provenance, deployed binary comparison, and finalized Skill/Escrow transaction collection, see [Devnet evidence collection](docs/DEVNET_EVIDENCE.md). Run `npm run build:devnet` before deployment and `npm run evidence:devnet -- --deployment-only` after deployment. Neither a build nor a deployment-only report proves that the two workflows have run.
