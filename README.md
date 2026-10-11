@@ -4,6 +4,13 @@ AgentOS is a Solana Agent Runtime and economic kernel. The first slice in this w
 
 ![alt text](SolanaAgentOS_arch_en.png)
 
+
+## Introduction video
+
+[![Watch the AgentOS introduction video on YouTube](https://img.youtube.com/vi/2hG_ECc_VYE/hqdefault.jpg)](https://www.youtube.com/watch?v=2hG_ECc_VYE)
+
+[Watch the introduction video on YouTube](https://www.youtube.com/watch?v=2hG_ECc_VYE).
+
 ## Run the control center
 
 For a complete, step-by-step Devnet demonstration—including wallet setup, deployment, Agent creation, payments, Escrow settlement, optional paid Skills, Session automation, MCP inspection, and troubleshooting—see the [judge demo runbook](docs/DEMO_RUNBOOK.md).
